@@ -7,6 +7,7 @@
 
 import { Context } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import s from '@deepseek-ai/schemastery'
 import { randomUUID } from 'node:crypto'
 import { Account, AccountCategory, JournalEntry, Posting } from './domain/index.js'
 
@@ -18,7 +19,7 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-/** 财务服务配置。 */
+/** 财务服务配置（运行时由 Cordis 注入并校验）。 */
 export interface FinanceConfig {
   /** 账套标识（多账簿预留，默认 'default'）。 */
   ledger?: string
@@ -33,12 +34,25 @@ export interface FinanceConfig {
 export class FinanceService extends TypertRemoteService {
   static inject = [] as const
 
+  /** 对齐 dsh 其他包的做法：用 schemastery 声明配置 schema，宿主校验后注入。 */
+  static Config: s<FinanceConfig> = s.object({
+    ledger: s.string().default('default'),
+  })
+
+  private readonly ledger: string
   private readonly accounts = new Map<string, Account>()
   private readonly entries = new Map<string, JournalEntry>()
 
   constructor(ctx: Context, config: FinanceConfig = {}) {
     super(ctx, 'finance')
-    // TODO: 读取 config.ledger，接 storage 适配器
+    // schemastery 已经补了默认值，这里直接读即可。
+    this.ledger = config.ledger ?? 'default'
+  }
+
+  /** 当前账套标识（只读）。 */
+  @Remote('getLedger')
+  getLedger(): string {
+    return this.ledger
   }
 
   /** 创建账户。 */
@@ -78,16 +92,31 @@ export class FinanceService extends TypertRemoteService {
     return { id: je.id, status: je.status, totalDebit: je.totalDebit, totalCredit: je.totalCredit }
   }
 
-  /** 试算平衡：所有账户余额汇总。 */
+  /** 试算平衡：按账户类别汇总借贷余额。 */
   @Remote('trialBalance')
-  trialBalance(): { totalDebit: number; totalCredit: number; balanced: boolean } {
-    // 简化版：资产+费用借余，负债+权益+收入贷余
+  trialBalance(): {
+    byCategory: Array<{ category: AccountCategory; debit: number; credit: number }>
+    totalDebit: number
+    totalCredit: number
+    balanced: boolean
+  } {
+    // 按 normalBalance 把余额归到借贷两侧：
+    //   资产/费用 → 借方余额
+    //   负债/权益/收入 → 贷方余额
+    const bucket = new Map<AccountCategory, { debit: number; credit: number }>()
     let d = 0, c = 0
     for (const a of this.accounts.values()) {
-      if (a.normalBalance === 'debit') d += a.balance
-      else c += a.balance
+      const cell = bucket.get(a.category) ?? { debit: 0, credit: 0 }
+      if (a.normalBalance === 'debit') { cell.debit += a.balance; d += a.balance }
+      else { cell.credit += a.balance; c += a.balance }
+      bucket.set(a.category, cell)
     }
-    return { totalDebit: d, totalCredit: c, balanced: Math.round(d * 100) === Math.round(c * 100) }
+    return {
+      byCategory: [...bucket.entries()].map(([category, v]) => ({ category, ...v })),
+      totalDebit: d,
+      totalCredit: c,
+      balanced: Math.round(d * 100) === Math.round(c * 100),
+    }
   }
 }
 
